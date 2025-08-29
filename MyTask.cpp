@@ -1,4 +1,12 @@
 #include "MyTask.h"
+
+// 静态成员初始化
+cppjieba::Jieba MyTask::m_tokenizer("./dict/jieba.dict.utf8",
+                                    "./dict/hmm_model.utf8",
+                                    "./dict/user.dict.utf8",
+                                    "./dict/idf.utf8",
+                                    "./dict/stop_words.utf8");
+
 void MyTask::process()
 {
     cout << "开始执行MyTask::process()" << endl;
@@ -22,7 +30,11 @@ void MyTask::process()
     catch (const std::exception &e)
     {
         cerr << "处理请求时发生错误: " << e.what() << endl;
-        _con->sendInLoop("Error: " + string(e.what()));
+        Message errorMsg;
+        errorMsg.tag = _msg.tag;
+        errorMsg.value = "Error: " + string(e.what());
+        errorMsg.length = errorMsg.value.size();
+        send_message_to_client(errorMsg);
     }
 }
 
@@ -30,44 +42,67 @@ bool MyTask::isNotChinese(std::string s)
 {
     auto it = utf8::iterator<std::string::iterator>{s.begin(), s.begin(), s.end()};
     char32_t cp = *it;
-    return (cp < 0x4E00 && cp > 0x9FFF) || (cp < 0x3400 && cp > 0x4DBF);
+    return !((cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3400 && cp <= 0x4DBF));
 }
 
 void MyTask::Recommand()
 {
     map<string, int> words_frqc;
     vector<string> words;
-    //m_tokenizer.Cut(_msg.value, words);
+
+    // 使用jieba分词
+    m_tokenizer.Cut(_msg.value, words);
+
     for (auto &word : words)
     {
         cout << "解析一个单词: " << word << endl;
-        // 英文
+
         if (isNotChinese(word))
         {
-            // 不是汉字 -> 在英文索引库和词库中查找
-            // 1.先打开 索引库 找到英文词库中都有哪些行有该关键字
+            // 英文处理
             string enIndexLib = "./IndexDatabase/enIndexLib.txt";
             ifstream ifs_IndexLib(enIndexLib);
             if (!ifs_IndexLib.is_open())
             {
                 cerr << "文件打开失败: " << enIndexLib << endl;
-                return;
+                continue;
             }
+
             std::transform(word.begin(), word.end(), word.begin(),
                            [](unsigned char c)
                            { return std::tolower(c); });
-            cout << "接到了输入的字母(已经转换为小写): " << word << endl;
-            // 英文好找,正好对应1-26行,这里无需一行一行地遍历之后再读了
-            string line;
-            for (int i = 0; i < (*word.c_str()) - 48; i++)
+
+            cout << "处理英文单词(小写): " << word << endl;
+
+            // 修正：使用字符减'a'而不是减48
+            char firstChar = word[0];
+            if (firstChar < 'a' || firstChar > 'z')
             {
-                getline(ifs_IndexLib, line);
+                ifs_IndexLib.close();
+                continue;
             }
-            // 将所有的行号塞到一个vector里面
+
+            string line;
+            // 跳到对应行
+            for (int i = 0; i < (firstChar - 'a'); i++)
+            {
+                if (!getline(ifs_IndexLib, line))
+                {
+                    break;
+                }
+            }
+
+            if (!getline(ifs_IndexLib, line))
+            {
+                ifs_IndexLib.close();
+                continue;
+            }
+
             string begin_alphabet;
             istringstream iss(line);
             iss >> begin_alphabet;
-            set<int> lineNums; // 所有的行号集合
+
+            set<int> lineNums;
             int num = 0;
             while (iss >> num)
             {
@@ -75,161 +110,192 @@ void MyTask::Recommand()
             }
             ifs_IndexLib.close();
 
-            // 去英文字段库找到对应的单词
+            // 去英文字典库找对应单词
             string enDicLib = "./DictionaryLibrary/enLib.txt";
             ifstream ifs_DicLib(enDicLib);
             if (!ifs_DicLib.is_open())
             {
                 cout << "文件打开失败: " << enDicLib << endl;
-                return;
+                continue;
             }
-            vector<string> words_en;
-            int index = 0;
-            int i = 0;
+
+            string dicLine;
+            int currentLine = 1;
+
             for (auto &lineNum : lineNums)
             {
+                // 重置文件指针到开头
+                ifs_DicLib.clear();
+                ifs_DicLib.seekg(0);
+                currentLine = 1;
 
-                index = lineNum;
-                string s;
-
-                while (i++ < index)
+                // 跳到指定行
+                while (currentLine < lineNum && getline(ifs_DicLib, dicLine))
                 {
-                    getline(ifs_DicLib, s);
+                    currentLine++;
                 }
 
-                // 找到第一个空格的位置
-                size_t pos = s.find_first_of(' ');
-
-                // 截取空格之前的部分
-                std::string before;
-                if (pos != std::string::npos)
+                if (currentLine == lineNum && getline(ifs_DicLib, dicLine))
                 {
-                    before = s.substr(0, pos);
-                }
-                else
-                {
-                    // 如果没有空格，就整个字符串
-                    before = s;
-                }
+                    size_t pos = dicLine.find_first_of(' ');
+                    string wordFromDict;
+                    if (pos != std::string::npos)
+                    {
+                        wordFromDict = dicLine.substr(0, pos);
+                    }
+                    else
+                    {
+                        wordFromDict = dicLine;
+                    }
 
-                words_en.push_back(before);
+                    if (!wordFromDict.empty())
+                    {
+                        words_frqc[wordFromDict]++;
+                    }
+                }
             }
-
-            // 将所有关键词添加到结果中
-            for (auto &word : words_en)
-            {
-                words_frqc[word]++;
-            }
+            ifs_DicLib.close();
         }
         else
         {
-            // 中文
+            // 中文处理
             string cnIndexLib = "./IndexDatabase/cnIndexLib.txt";
             ifstream ifs_IndexLib(cnIndexLib);
             if (!ifs_IndexLib.is_open())
             {
                 cerr << "文件打开失败: " << cnIndexLib << endl;
-                return;
+                continue;
             }
+
             set<int> lineNums;
-            string begin_word;
             string line;
+            bool found = false;
+
             while (getline(ifs_IndexLib, line))
             {
-                if (word == begin_word)
+                istringstream iss(line);
+                string begin_word;
+                iss >> begin_word;
+
+                if (word == begin_word) // 修正：正确比较
                 {
-                    istringstream iss(line);
-                    string temp;
-                    iss >> temp;
-                    temp.clear();
-                    while (iss >> temp)
+                    int num;
+                    while (iss >> num)
                     {
-                        lineNums.insert(stoi(temp));
+                        lineNums.insert(num);
                     }
+                    found = true;
+                    break;
                 }
-                break;
             }
-            // 带着行号集合set<int> lines 去中文字典库中找
+            ifs_IndexLib.close();
+
+            if (!found || lineNums.empty())
+            {
+                continue;
+            }
+
+            // 去中文字典库找对应单词
             string cnDicLib = "./DictionaryLibrary/cnLib.txt";
             ifstream ifs_DicLib(cnDicLib);
             if (!ifs_DicLib.is_open())
             {
                 cerr << "文件打开失败: " << cnDicLib << endl;
-                return;
+                continue;
             }
-            vector<string> words_cn;
-            int num = 0;
-            int i = 0;
+
+            string dicLine;
+            int currentLine = 1;
+
             for (auto &lineNum : lineNums)
             {
+                // 重置文件指针到开头
+                ifs_DicLib.clear();
+                ifs_DicLib.seekg(0);
+                currentLine = 1;
 
-                num = lineNum;
-                string s;
-
-                while (i++ < num)
+                // 跳到指定行
+                while (currentLine < lineNum && getline(ifs_DicLib, dicLine))
                 {
-                    getline(ifs_DicLib, s);
+                    currentLine++;
                 }
 
-                // 找到第一个空格的位置
-                size_t pos = s.find_first_of(' ');
-
-                // 截取空格之前的部分
-                std::string before;
-                if (pos != std::string::npos)
+                if (currentLine == lineNum && getline(ifs_DicLib, dicLine))
                 {
-                    before = s.substr(0, pos);
-                }
-                else
-                {
-                    // 如果没有空格，就整个字符串
-                    before = s;
-                }
+                    size_t pos = dicLine.find_first_of(' ');
+                    string wordFromDict;
+                    if (pos != std::string::npos)
+                    {
+                        wordFromDict = dicLine.substr(0, pos);
+                    }
+                    else
+                    {
+                        wordFromDict = dicLine;
+                    }
 
-                words_cn.push_back(before);
+                    if (!wordFromDict.empty())
+                    {
+                        words_frqc[wordFromDict]++;
+                    }
+                }
             }
-
-            // 将所有关键词添加到结果中
-            for (auto &word : words_cn)
-            {
-                words_frqc[word]++;
-            }
+            ifs_DicLib.close();
         }
     }
+
+    // 构建候选词
     vector<Candidate> candidates;
-    for (auto &word : words_frqc)
+    for (auto &wordPair : words_frqc)
     {
-        int edit_dis = editDistance(_msg.value, word.first);
-        int frqc = word.second;
-        candidates.push_back({word.first, edit_dis, frqc});
+        int edit_dis = editDistance(_msg.value, wordPair.first);
+        int frqc = wordPair.second;
+        candidates.push_back({wordPair.first, edit_dis, frqc});
     }
+
     vector<Candidate> result = selectTopK(candidates, 5);
 
-    //  返回给客户端
-    // 构造返回消息
+    // 构造返回消息（修正：使用TLV格式）
     Message response;
     response.tag = 1;
 
     string value;
-    for (const auto &candidate : result)
+    for (size_t i = 0; i < result.size(); ++i)
     {
-        value += candidate.word + " ";
+        value += result[i].word;
+        if (i < result.size() - 1)
+        {
+            value += " ";
+        }
     }
 
     response.value = value;
     response.length = value.size();
 
+    cout << "推荐结果: " << value << endl;
+
     // 发送给客户端
-    stringstream ss;
-    ss << response.tag << " " << response.length << " " << response.value;
-    _con->sendInLoop(ss.str());
+    send_message_to_client(response);
 }
 
-void MyTask::send_message(int connfd, const Message &msg)
+void MyTask::send_message_to_client(const Message &msg)
 {
-    send(connfd, &msg.tag, sizeof(msg.tag), 0);
-    send(connfd, &msg.length, sizeof(msg.length), 0);
-    send(connfd, msg.value.c_str(), msg.length, 0);
+    // 构造TLV格式的消息
+    vector<char> buffer;
+    buffer.reserve(sizeof(msg.tag) + sizeof(msg.length) + msg.length);
+
+    // 头部
+    const char *p = reinterpret_cast<const char *>(&msg.tag);
+    buffer.insert(buffer.end(), p, p + sizeof(msg.tag));
+
+    p = reinterpret_cast<const char *>(&msg.length);
+    buffer.insert(buffer.end(), p, p + sizeof(msg.length));
+
+    // 主体
+    buffer.insert(buffer.end(), msg.value.begin(), msg.value.end());
+
+    // 通过连接发送
+    string dataToSend(buffer.begin(), buffer.end());
+    _con->sendInLoop(dataToSend);
 }
 
 vector<Candidate> MyTask::selectTopK(vector<Candidate> &candidates, int k)
@@ -255,28 +321,24 @@ int MyTask::editDistance(const string &s1, const string &s2)
     int m = s1.size(), n = s2.size();
     vector<vector<int>> dp(m + 1, vector<int>(n + 1, 0));
 
-    // 初始化边界
     for (int i = 0; i <= m; i++)
         dp[i][0] = i;
     for (int j = 0; j <= n; j++)
         dp[0][j] = j;
 
-    // 动态规划填表
     for (int i = 1; i <= m; i++)
     {
         for (int j = 1; j <= n; j++)
         {
             if (s1[i - 1] == s2[j - 1])
             {
-                dp[i][j] = dp[i - 1][j - 1]; // 相等，无需操作
+                dp[i][j] = dp[i - 1][j - 1];
             }
             else
             {
-                dp[i][j] = 1 + min({
-                                   dp[i - 1][j],    // 删除
-                                   dp[i][j - 1],    // 插入
-                                   dp[i - 1][j - 1] // 替换
-                               });
+                dp[i][j] = 1 + min({dp[i - 1][j],
+                                    dp[i][j - 1],
+                                    dp[i - 1][j - 1]});
             }
         }
     }
